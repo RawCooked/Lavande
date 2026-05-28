@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm --version)",
+      "Bash(corepack enable *)",
+      "Bash(corepack prepare *)",
+      "Bash(pnpm install *)",
+      "Bash(pnpm typecheck *)",
+      "Bash(pnpm build *)",
+      "Bash(node bin/lavande.js tools)",
+      "Bash(node bin/lavande.js config)",
+      "Bash(node bin/lavande.js config:path)",
+      "Bash(node bin/lavande.js --version)",
+      "Bash(node bin/lavande.js --help)",
+      "Bash(LAVANDE_PROVIDER=anthropic node bin/lavande.js config)",
+      "Bash(node bin/lavande.js config:set ui.gradient false)",
+      "Bash(node bin/lavande.js config:set ui.gradient true)"
+    ]
+  }
+}
