@@ -4,7 +4,7 @@ import type { LLMProvider } from '../llm/types.js';
 import type { MemoryStore } from '../memory/store.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ConfirmRequest } from '../tools/types.js';
-import type { ChatMessage, ToolCallRef } from '../types/index.js';
+import type { ChatMessage, MessageImage, ToolCallRef } from '../types/index.js';
 import { logger } from '../utils/logger.js';
 import { assistantMessage, compactHistory, toolMessage, userMessage } from './messages.js';
 import { buildSystemPrompt } from './systemPrompt.js';
@@ -81,6 +81,9 @@ export class Agent {
       let assistantText = '';
       const pendingCalls: ToolCallRef[] = [];
       let finishReason: 'stop' | 'tool_calls' | 'length' = 'stop';
+      // Raw model parts emitted by the provider (e.g. Gemini thoughtSignature).
+      // Stored verbatim so they can be replayed in the next request.
+      let rawModelParts: unknown[] | undefined;
 
       try {
         for await (const event of this.deps.provider.stream({
@@ -102,6 +105,10 @@ export class Agent {
             case 'tool_call':
               pendingCalls.push({ id: event.id, name: event.name, args: event.args });
               break;
+            case 'model_parts':
+              // Capture raw parts for verbatim replay (needed by thinking models).
+              rawModelParts = event.parts;
+              break;
             case 'done':
               finishReason = event.reason;
               break;
@@ -120,8 +127,8 @@ export class Agent {
         return;
       }
 
-      // Persist this turn's assistant message (with any tool calls it requested).
-      const asstMsg = assistantMessage(assistantText, pendingCalls);
+      // Persist this turn's assistant message (including raw parts if present).
+      const asstMsg = assistantMessage(assistantText, pendingCalls, rawModelParts);
       this.history.push(asstMsg);
       await this.deps.memory.appendMessage(convId, asstMsg);
 
@@ -149,7 +156,9 @@ export class Agent {
 
         yield { type: 'tool_end', id: call.id, name: call.name, result };
 
-        const toolMsg = toolMessage(call.id, call.name, result.output);
+        // Some tools (e.g. screenshot) return images the model should see.
+        const images = extractImages(result.meta);
+        const toolMsg = toolMessage(call.id, call.name, result.output, images);
         this.history.push(toolMsg);
         await this.deps.memory.appendMessage(convId, toolMsg);
       }
@@ -162,4 +171,29 @@ export class Agent {
     yield { type: 'error', message: `Agent stopped after ${maxIterations} iterations.` };
     yield { type: 'turn_end', reason: 'error' };
   }
+}
+
+/**
+ * Pull image attachments out of a tool result's `meta.images`, validating the
+ * shape so a malformed tool can't corrupt the history. Returns undefined when
+ * there are no usable images.
+ */
+function extractImages(meta: Record<string, unknown> | undefined): MessageImage[] | undefined {
+  const raw = meta?.images;
+  if (!Array.isArray(raw)) return undefined;
+  const images: MessageImage[] = [];
+  for (const item of raw) {
+    if (
+      item &&
+      typeof item === 'object' &&
+      typeof (item as MessageImage).path === 'string' &&
+      typeof (item as MessageImage).mimeType === 'string'
+    ) {
+      images.push({
+        path: (item as MessageImage).path,
+        mimeType: (item as MessageImage).mimeType,
+      });
+    }
+  }
+  return images.length ? images : undefined;
 }

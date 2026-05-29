@@ -1,15 +1,37 @@
-import type { ChatMessage, ToolCallRef } from '../types/index.js';
+import type { ChatMessage, MessageImage, ToolCallRef } from '../types/index.js';
 
 export function userMessage(content: string): ChatMessage {
   return { role: 'user', content };
 }
 
-export function assistantMessage(content: string, toolCalls?: ToolCallRef[]): ChatMessage {
-  return { role: 'assistant', content, ...(toolCalls?.length ? { toolCalls } : {}) };
+export function assistantMessage(
+  content: string,
+  toolCalls?: ToolCallRef[],
+  rawModelParts?: unknown[],
+): ChatMessage {
+  return {
+    role: 'assistant',
+    content,
+    ...(toolCalls?.length ? { toolCalls } : {}),
+    // Store raw provider parts verbatim (e.g. Gemini thoughtSignature) so
+    // they can be replayed in the next request without reconstruction loss.
+    ...(rawModelParts?.length ? { rawModelParts } : {}),
+  };
 }
 
-export function toolMessage(toolCallId: string, toolName: string, content: string): ChatMessage {
-  return { role: 'tool', content, toolCallId, toolName };
+export function toolMessage(
+  toolCallId: string,
+  toolName: string,
+  content: string,
+  images?: MessageImage[],
+): ChatMessage {
+  return {
+    role: 'tool',
+    content,
+    toolCallId,
+    toolName,
+    ...(images?.length ? { images } : {}),
+  };
 }
 
 /**

@@ -34,6 +34,14 @@ export type JSONSchemaProperty =
 export type StreamEvent =
   | { type: 'text'; delta: string }
   | { type: 'tool_call'; id: string; name: string; args: unknown }
+  /**
+   * Emitted once per turn, just before `done`, carrying the complete raw
+   * provider parts for the model message. Consumers that need to replay
+   * opaque fields (e.g. Gemini `thoughtSignature`) must store this and pass
+   * it back via `ChatMessage.rawModelParts`. Providers that don't need it
+   * simply never emit this event.
+   */
+  | { type: 'model_parts'; parts: unknown[] }
   | { type: 'done'; reason: 'stop' | 'tool_calls' | 'length' }
   | { type: 'error'; error: Error };
 

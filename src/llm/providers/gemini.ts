@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { GoogleGenAI } from '@google/genai';
 import { LavandeError } from '../../utils/errors.js';
 import { logger } from '../../utils/logger.js';
@@ -14,9 +15,10 @@ import type {
 const log = logger.scope('gemini');
 
 type GeminiPart =
-  | { text: string }
-  | { functionCall: { name: string; args: Record<string, unknown> } }
-  | { functionResponse: { id?: string; name: string; response: Record<string, unknown> } };
+  | { text: string; thoughtSignature?: string }
+  | { functionCall: { id?: string; name: string; args: Record<string, unknown> } }
+  | { functionResponse: { id?: string; name: string; response: Record<string, unknown> } }
+  | { inlineData: { mimeType: string; data: string } };
 
 interface GeminiContent {
   role: 'user' | 'model';
@@ -43,11 +45,23 @@ export function createGeminiProvider(opts: ProviderOptions): LLMProvider {
         ? [{ functionDeclarations: req.tools.map(toGeminiTool) }]
         : undefined;
 
-      log.debug('stream:start', { model, messages: contents.length, tools: req.tools.length });
+      log.debug('request:start', { model, messages: contents.length, tools: req.tools.length });
 
+      /**
+       * Non-streaming generateContent.
+       *
+       * Why not generateContentStream? Gemini thinking models (gemini-3-*,
+       * 2.5-thinking, …) attach an opaque `thoughtSignature` to the part that
+       * carries the functionCall. The API REQUIRES that signature to be echoed
+       * back verbatim on the next request. During streaming, the SDK does not
+       * reliably surface that signature on the functionCall part — it is only
+       * complete in the aggregated response. So we fetch the full response in
+       * one call (canonical parts, signature intact), store the parts verbatim
+       * for replay, and reproduce a streaming feel by chunking the text below.
+       */
       let response;
       try {
-        response = await client.models.generateContentStream({
+        response = await client.models.generateContent({
           model,
           contents,
           config: {
@@ -60,38 +74,68 @@ export function createGeminiProvider(opts: ProviderOptions): LLMProvider {
         return;
       }
 
-      let finishReason: 'stop' | 'tool_calls' | 'length' = 'stop';
-      let sawToolCall = false;
-
-      try {
-        for await (const chunk of response) {
-          if (req.signal?.aborted) break;
-
-          const text = extractText(chunk);
-          if (text) yield { type: 'text', delta: text };
-
-          const calls = extractFunctionCalls(chunk);
-          for (const call of calls) {
-            sawToolCall = true;
-            yield {
-              type: 'tool_call',
-              id: call.id ?? `${call.name}-${Math.random().toString(36).slice(2, 8)}`,
-              name: call.name,
-              args: call.args ?? {},
-            };
-          }
-
-          const reason = extractFinishReason(chunk);
-          if (reason === 'MAX_TOKENS') finishReason = 'length';
-        }
-      } catch (err) {
-        yield { type: 'error', error: wrapError(err) };
+      if (req.signal?.aborted) {
+        yield { type: 'done', reason: 'stop' };
         return;
       }
 
-      yield { type: 'done', reason: sawToolCall ? 'tool_calls' : finishReason };
+      // Complete, canonical parts — includes thoughtSignature on functionCall
+      // parts for thinking models. Stored verbatim and replayed next turn.
+      const rawParts = extractRawParts(response);
+
+      // Stream the visible text out in small chunks for a progressive feel.
+      const text = extractText(response);
+      if (text) {
+        for (const piece of chunkText(text)) {
+          if (req.signal?.aborted) break;
+          yield { type: 'text', delta: piece };
+          await delay(12);
+        }
+      }
+
+      // Tool / function calls.
+      const calls = extractFunctionCalls(response);
+      let sawToolCall = false;
+      for (const call of calls) {
+        sawToolCall = true;
+        yield {
+          type: 'tool_call',
+          id: call.id ?? `${call.name}-${Math.random().toString(36).slice(2, 8)}`,
+          name: call.name,
+          args: call.args ?? {},
+        };
+      }
+
+      // Emit raw parts before done so the agent can store them for replay.
+      if (rawParts.length > 0) {
+        yield { type: 'model_parts', parts: rawParts };
+      }
+
+      const reason = extractFinishReason(response);
+      yield {
+        type: 'done',
+        reason: sawToolCall ? 'tool_calls' : reason === 'MAX_TOKENS' ? 'length' : 'stop',
+      };
     },
   };
+}
+
+/* ───────────────────── streaming-effect helpers ───────────────────── */
+
+const delay = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Split text into ~24-char chunks at whitespace boundaries so the UI can
+ * render it progressively without cutting words mid-stream.
+ */
+function* chunkText(text: string, size = 24): Generator<string> {
+  let i = 0;
+  while (i < text.length) {
+    let end = Math.min(i + size, text.length);
+    while (end < text.length && !/\s/.test(text[end] ?? '')) end += 1;
+    yield text.slice(i, end);
+    i = end;
+  }
 }
 
 /* ───────────────────── conversion ───────────────────── */
@@ -107,21 +151,30 @@ function toGeminiContents(messages: ChatMessage[]): GeminiContent[] {
     }
 
     if (msg.role === 'assistant') {
-      const parts: GeminiPart[] = [];
-      if (msg.content) parts.push({ text: msg.content });
-      for (const call of msg.toolCalls ?? []) {
-        parts.push({
-          functionCall: { name: call.name, args: (call.args ?? {}) as Record<string, unknown> },
-        });
+      if (msg.rawModelParts && msg.rawModelParts.length > 0) {
+        /**
+         * Verbatim replay — preserves thoughtSignature for thinking models.
+         * The parts were collected as-is from the streaming response, so they
+         * already contain every field the API expects back.
+         */
+        out.push({ role: 'model', parts: msg.rawModelParts as GeminiPart[] });
+      } else {
+        // Fallback reconstruction for non-thinking models or imported history.
+        const parts: GeminiPart[] = [];
+        if (msg.content) parts.push({ text: msg.content });
+        for (const call of msg.toolCalls ?? []) {
+          parts.push({
+            functionCall: { name: call.name, args: (call.args ?? {}) as Record<string, unknown> },
+          });
+        }
+        if (parts.length === 0) parts.push({ text: '' });
+        out.push({ role: 'model', parts });
       }
-      if (parts.length === 0) parts.push({ text: '' });
-      out.push({ role: 'model', parts });
       continue;
     }
 
     if (msg.role === 'tool') {
-      // Include the id so Gemini can correlate this response with the
-      // functionCall it made. Required when multiple calls are in-flight.
+      // Include the id so Gemini can correlate this response with its functionCall.
       out.push({
         role: 'user',
         parts: [
@@ -134,6 +187,28 @@ function toGeminiContents(messages: ChatMessage[]): GeminiContent[] {
           },
         ],
       });
+
+      // If the tool produced images (e.g. a screenshot), read them from disk
+      // and inline them as a follow-up user turn so the model can see them.
+      // Stored as a path (not base64) to keep persisted history small — we
+      // base64-encode lazily here, at request time.
+      if (msg.images?.length) {
+        const imageParts: GeminiPart[] = [];
+        for (const img of msg.images) {
+          try {
+            const data = readFileSync(img.path).toString('base64');
+            imageParts.push({ inlineData: { mimeType: img.mimeType, data } });
+          } catch (err) {
+            log.debug('image:read-failed', { path: img.path, err: String(err) });
+          }
+        }
+        if (imageParts.length > 0) {
+          out.push({
+            role: 'user',
+            parts: [{ text: 'Here is the captured image for you to analyze:' }, ...imageParts],
+          });
+        }
+      }
     }
   }
   return out;
@@ -173,6 +248,21 @@ function cleanSchema(schema: JSONSchemaProperty | ToolSpec['parameters']): unkno
 
 /* ───────────────────── chunk extraction ───────────────────── */
 
+interface Candidate {
+  content?: { parts?: Array<Record<string, unknown>> };
+  finishReason?: string;
+}
+
+/**
+ * Return ALL raw parts from a streaming chunk, including thought parts with
+ * `thoughtSignature`. These are collected verbatim for replay.
+ */
+function extractRawParts(chunk: unknown): unknown[] {
+  if (!chunk || typeof chunk !== 'object') return [];
+  const c = chunk as { candidates?: Candidate[] };
+  return c.candidates?.[0]?.content?.parts ?? [];
+}
+
 function extractText(chunk: unknown): string {
   if (!chunk || typeof chunk !== 'object') return '';
   const c = chunk as { text?: string | (() => string); candidates?: Candidate[] };
@@ -184,7 +274,12 @@ function extractText(chunk: unknown): string {
 
   const parts = c.candidates?.[0]?.content?.parts ?? [];
   return parts
-    .map((p) => (typeof p === 'object' && p !== null && 'text' in p ? String(p.text ?? '') : ''))
+    .map((p) => {
+      if (typeof p !== 'object' || p === null || !('text' in p)) return '';
+      // Skip thought parts — they contain the reasoning, not the response text.
+      if ('thoughtSignature' in p) return '';
+      return String(p.text ?? '');
+    })
     .join('');
 }
 
@@ -192,11 +287,6 @@ interface FunctionCall {
   id?: string;
   name: string;
   args?: Record<string, unknown>;
-}
-
-interface Candidate {
-  content?: { parts?: Array<Record<string, unknown>> };
-  finishReason?: string;
 }
 
 function extractFunctionCalls(chunk: unknown): FunctionCall[] {
@@ -242,6 +332,13 @@ function wrapError(err: unknown): Error {
         cause: err,
       });
     }
+    if (/thought_signature|thought signature/i.test(err.message)) {
+      return new LavandeError('Gemini thinking-model error: thought_signature missing.', {
+        code: 'THOUGHT_SIGNATURE',
+        hint: 'This is a known issue with thinking models. The fix is active — please restart and retry.',
+        cause: err,
+      });
+    }
     if (/exception parsing|invalid.*function.*response|function_response/i.test(err.message)) {
       return new LavandeError('Gemini rejected the conversation history.', {
         code: 'PARSE_ERROR',
@@ -253,6 +350,13 @@ function wrapError(err: unknown): Error {
       return new LavandeError(`Model not available: ${err.message}`, {
         code: 'MODEL_UNAVAILABLE',
         hint: 'Try LAVANDE_MODEL=gemini-2.5-flash or gemini-2.0-flash.',
+        cause: err,
+      });
+    }
+    if (/quota|resource_exhausted|429|rate.?limit/i.test(err.message)) {
+      return new LavandeError('Gemini quota exceeded.', {
+        code: 'QUOTA_EXCEEDED',
+        hint: 'The free tier allows a limited number of requests per day (and each tool turn costs two). Wait a little, switch model with LAVANDE_MODEL=gemini-2.5-flash, or enable billing in Google AI Studio.',
         cause: err,
       });
     }
