@@ -44,4 +44,4 @@ export interface ToolCallRef {
   args: unknown;
 }
 
-export type ProviderName = 'gemini' | 'openai' | 'anthropic' | 'ollama';
+export type ProviderName = 'gemini' | 'openai' | 'anthropic' | 'ollama' | 'minicpm';

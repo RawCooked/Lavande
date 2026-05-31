@@ -65,6 +65,11 @@ export class Agent {
 
     let iterations = 0;
     const maxIterations = this.deps.config.agent.maxIterations;
+    // Tracks tool-call fingerprints we've already executed in THIS user turn.
+    // Weak models (MiniCPM-1B, similar) sometimes re-emit the same function
+    // call after seeing its response instead of replying in prose. Without a
+    // guard the agent would happily re-run "open_app brave" eight times.
+    const calledFingerprints = new Set<string>();
 
     outer: while (iterations < maxIterations) {
       iterations += 1;
@@ -137,8 +142,21 @@ export class Agent {
         return;
       }
 
+      // Duplicate-call guard: if every pending call repeats one we already
+      // ran this turn, the model is stuck in a "re-emit the same tool" loop.
+      // End the turn here so the user isn't subjected to N more identical
+      // executions.
+      const allDuplicates = pendingCalls.every((c) =>
+        calledFingerprints.has(fingerprintCall(c.name, c.args)),
+      );
+      if (allDuplicates) {
+        yield { type: 'turn_end', reason: 'stop' };
+        return;
+      }
+
       // Execute each tool call, append results, then loop for follow-up reasoning.
       for (const call of pendingCalls) {
+        calledFingerprints.add(fingerprintCall(call.name, call.args));
         yield { type: 'tool_start', id: call.id, name: call.name, args: call.args };
 
         const result = await this.deps.tools.execute(call.name, call.args, {
@@ -170,6 +188,15 @@ export class Agent {
 
     yield { type: 'error', message: `Agent stopped after ${maxIterations} iterations.` };
     yield { type: 'turn_end', reason: 'error' };
+  }
+}
+
+/** Stable fingerprint for a tool call so we can detect exact repeats. */
+function fingerprintCall(name: string, args: unknown): string {
+  try {
+    return `${name}:${JSON.stringify(args)}`;
+  } catch {
+    return `${name}:${String(args)}`;
   }
 }
 

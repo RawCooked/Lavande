@@ -1,7 +1,7 @@
 import { z } from 'zod';
 
 export const ConfigSchema = z.object({
-  provider: z.enum(['gemini', 'openai', 'anthropic', 'ollama']).default('gemini'),
+  provider: z.enum(['gemini', 'openai', 'anthropic', 'ollama', 'minicpm']).default('gemini'),
   model: z.string().default('gemini-2.5-flash'),
   apiKey: z.string().optional(),
   enabledTools: z.union([z.array(z.string()), z.literal('*')]).default('*'),

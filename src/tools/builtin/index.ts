@@ -10,6 +10,7 @@ import { clipboardTool } from './clipboard.js';
 import { dateTimeTool } from './dateTime.js';
 import { listDirTool } from './listDir.js';
 import { openAppTool } from './openApp.js';
+import { openUrlTool } from './openUrl.js';
 import { readFileTool } from './readFile.js';
 import { runCommandTool } from './runCommand.js';
 import { screenshotTool } from './screenshot.js';
@@ -20,6 +21,7 @@ export const builtinTools: Tool[] = [
   writeFileTool,
   listDirTool,
   openAppTool,
+  openUrlTool,
   runCommandTool,
   screenshotTool,
   dateTimeTool,
